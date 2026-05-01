@@ -1,0 +1,133 @@
+server:
+  port: 9600
+  host: "0.0.0.0"
+  auth_token: "change-me-in-production"
+  cors_origins: ["http://localhost:1420"]
+  mdns_enabled: true
+  mdns_name: "avatar-agent-desktop"
+
+principal:
+  profile_path: "./profiles/default.json"
+
+review:
+  timeout_seconds: 5
+  auto_select_recommended: true
+  keyboard_shortcuts_enabled: true
+
+audio:
+  stt:
+    primary: "faster-whisper"
+    fallback: "google-stt"
+    whisper:
+      model: "large-v3"
+      device: "cuda"
+      compute_type: "float16"
+      language: "en"
+    google:
+      credentials_path: "./credentials/google-stt.json"
+      language_code: "en-US"
+
+  tts:
+    primary: "elevenlabs"
+    fallback: "coqui-xtts"
+    elevenlabs:
+      api_key: "${ELEVENLABS_API_KEY}"
+      voice_id: "your-voice-id"
+      model_id: "eleven_turbo_v2_5"
+      latency_optimization: 3
+    coqui:
+      model_path: "./models/coqui-xtts"
+      voice_sample: "./voice/my-voice-sample.wav"
+      device: "cuda"
+
+  vad:
+    engine: "silero"
+    threshold: 0.5
+    min_silence_duration_ms: 1500
+    speech_pad_ms: 300
+
+llm:
+  primary: "anthropic"
+  fallback: "ollama"
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-20250514"
+    max_tokens: 1500
+    temperature: 0.7
+    timeout_seconds: 8
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    model: "gpt-4o"
+    max_tokens: 1500
+    temperature: 0.7
+  ollama:
+    model: "llama3:8b-instruct"
+    base_url: "http://localhost:11434"
+    timeout_seconds: 15
+  custom:
+    base_url: "${CUSTOM_BASE_URL}"
+    api_key: "${CUSTOM_API_KEY}"
+    model: "${CUSTOM_MODEL}"
+    max_tokens: 1500
+    temperature: 0.7
+    timeout_seconds: 15
+
+lipsync:
+  enabled: false
+  engine: "wav2lip"
+  reference_image: "./face/reference.png"
+  fps: 25
+  device: "cuda"
+  wav2lip:
+    model_path: "./models/wav2lip/wav2lip_gan.pth"
+    face_detect_path: "./models/wav2lip/s3fd.pth"
+  sadtalker:
+    model_path: "./models/sadtalker/"
+
+browser:
+  engine: "playwright"
+  browser_type: "chromium"
+  headless: false
+  user_data_dir: "./browser_profile"
+  default_step_timeout_ms: 15000
+  max_retries_per_step: 1
+  default_app: "teams"
+  app_urls:
+    teams: "https://teams.microsoft.com"
+    slack: "https://app.slack.com"
+    discord: "https://discord.com/app"
+
+virtual_devices:
+  audio:
+    linux:
+      sink_name: "avatar_agent_mic"
+      module: "module-null-sink"
+    macos:
+      driver: "blackhole"
+    windows:
+      driver: "vb-cable"
+  camera:
+    linux:
+      device: "/dev/video10"
+      module: "v4l2loopback"
+    macos:
+      driver: "obs"
+    windows:
+      driver: "obs"
+
+notifications:
+  push_enabled: true
+  firebase:
+    credentials_path: "./credentials/firebase-admin.json"
+  events:
+    - "review_started"
+    - "intervention_needed"
+    - "call_connected"
+    - "call_ended"
+
+logging:
+  level: "INFO"
+  format: "json"
+  file: "./logs/agent.log"
+  max_size_mb: 50
+  backup_count: 5
