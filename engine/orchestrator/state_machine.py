@@ -49,6 +49,7 @@ class StateContext:
     call_start_time: Optional[float] = None
     error_source_state: Optional[AgentState] = None
     error_message: Optional[str] = None
+    selected_response: Optional[str] = None  # set by HUMAN_REVIEW (Phase 3)
 
 
 class Orchestrator:
@@ -64,11 +65,24 @@ class Orchestrator:
         await orchestrator.run_until_idle()
     """
 
-    def __init__(self, llm=None, browser=None, broadcast: Optional[Callable] = None):
+    def __init__(
+        self,
+        llm=None,
+        browser=None,
+        stt=None,
+        tts=None,
+        vad=None,
+        virtual_mic_device: Optional[str] = None,
+        broadcast: Optional[Callable] = None,
+    ):
         """
         Args:
             llm: LLMClient instance (for planning)
             browser: BrowserPool instance (for browser automation)
+            stt: STTClient instance (Phase 2+)
+            tts: TTSClient instance (Phase 2+)
+            vad: SileroVAD instance (Phase 2+)
+            virtual_mic_device: sounddevice device name for TTS injection (Phase 2+)
             broadcast: Async callable that receives event dicts to send to connected UIs.
                        Defaults to a no-op if not provided.
         """
@@ -76,6 +90,10 @@ class Orchestrator:
         self.ctx = StateContext()
         self._llm = llm
         self._browser = browser
+        self._stt = stt
+        self._tts = tts
+        self._vad = vad
+        self._virtual_mic_device = virtual_mic_device
         self._broadcast = broadcast or self._default_broadcast
 
         # Event queue: UI events are pushed here, state handlers drain it
@@ -438,9 +456,69 @@ class Orchestrator:
             await self._transition(AgentState.CALL_ENDED)
 
     async def _handle_listening(self) -> None:
-        log.info("state_listening", message="[Phase 2] STT pipeline not yet implemented")
+        if not self._stt or not self._vad:
+            log.info("state_listening", message="[Phase 2] STT/VAD not configured")
+            await self._transition(AgentState.CALL_ENDED)
+            return
+
+        log.info("state_listening")
         await self._broadcast({"type": "listening"})
-        await self._transition(AgentState.CALL_ENDED)
+
+        utterance_buffer = bytearray()
+
+        try:
+            while True:
+                audio_data = await self._wait_for_event("audio_chunk", timeout=30.0)
+                if not audio_data:
+                    continue
+
+                chunk = audio_data if isinstance(audio_data, (bytes, bytearray)) else bytes(audio_data)
+                utterance_buffer.extend(chunk)
+
+                # Partial transcript for live UI display
+                partial = await self._stt.transcribe_chunk(chunk)
+                if partial.text:
+                    await self._broadcast({"type": "partial_transcript", "text": partial.text})
+
+                # VAD: detect utterance boundary
+                for vad_result in self._vad.process_chunk(chunk):
+                    if not vad_result.utterance_complete:
+                        continue
+
+                    final = await self._stt.transcribe_utterance(bytes(utterance_buffer))
+                    utterance_buffer = bytearray()
+                    self._vad.reset()
+
+                    if not final.text.strip():
+                        continue
+
+                    turn = {
+                        "speaker": "other",
+                        "text": final.text,
+                        "turn": self.ctx.turn_number,
+                    }
+                    self.ctx.transcript.append(turn)
+                    self.ctx.turn_number += 1
+                    log.info(
+                        "utterance_received",
+                        turn=self.ctx.turn_number,
+                        preview=final.text[:80],
+                    )
+                    await self._broadcast({
+                        "type": "utterance_complete",
+                        "text": final.text,
+                        "turn": self.ctx.turn_number,
+                    })
+                    await self._transition(AgentState.GENERATING)
+                    return
+
+        except asyncio.TimeoutError:
+            log.info("listening_timeout", message="No audio for 30 s — ending call")
+            await self._transition(AgentState.CALL_ENDED)
+        except Exception as exc:
+            self.ctx.error_message = f"Listening failed: {exc}"
+            self.ctx.error_source_state = AgentState.LISTENING
+            await self._transition(AgentState.ERROR)
 
     async def _handle_generating(self) -> None:
         log.info("state_generating", message="[Phase 3] LLM response generation not yet implemented")
@@ -451,8 +529,32 @@ class Orchestrator:
         await self._transition(AgentState.CALL_ENDED)
 
     async def _handle_speaking(self) -> None:
-        log.info("state_speaking", message="[Phase 4] TTS not yet implemented")
-        await self._transition(AgentState.LISTENING)
+        text = self.ctx.selected_response
+        if not self._tts or not text:
+            log.info("state_speaking", message="[Phase 3] TTS or response not ready")
+            await self._transition(AgentState.LISTENING)
+            return
+
+        log.info("state_speaking", preview=text[:80])
+        await self._broadcast({"type": "speaking", "text": text})
+
+        try:
+            from engine.modules.audio.virtual_devices import inject_audio
+            audio_stream = self._tts.synthesize(text)
+            if self._virtual_mic_device:
+                await inject_audio(audio_stream, device=self._virtual_mic_device)
+            else:
+                async for _ in audio_stream:
+                    pass  # drain without injecting (test/dry-run mode)
+
+            self.ctx.selected_response = None
+            log.info("speaking_complete")
+            await self._broadcast({"type": "speaking_complete"})
+            await self._transition(AgentState.LISTENING)
+        except Exception as exc:
+            self.ctx.error_message = f"Speaking failed: {exc}"
+            self.ctx.error_source_state = AgentState.SPEAKING
+            await self._transition(AgentState.ERROR)
 
     async def _handle_manual_override(self) -> None:
         log.info("state_manual_override", message="Manual override active — waiting for resume or end")
