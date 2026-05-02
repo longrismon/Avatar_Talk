@@ -244,6 +244,7 @@ class VirtualDevicesConfig(BaseModel):
 
 class FirebaseConfig(BaseModel):
     credentials_path: str = "./credentials/firebase-admin.json"
+    device_token: str = ""  # FCM registration token of the principal's mobile device
 
 
 class NotificationsConfig(BaseModel):
