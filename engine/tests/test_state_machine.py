@@ -262,3 +262,200 @@ class TestSnapshotAndBroadcast:
         assert len(state_events) >= 1
         assert state_events[-1]["from"] == "IDLE"
         assert state_events[-1]["to"] == "PLANNING"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — GENERATING state
+# ---------------------------------------------------------------------------
+
+def _make_options() -> list[dict]:
+    return [
+        {"id": 1, "text": "Option A", "tone": "professional", "recommended": False},
+        {"id": 2, "text": "Option B", "tone": "empathetic", "recommended": False},
+        {"id": 3, "text": "Option C", "tone": "direct", "recommended": True},
+        {"id": 4, "text": "Option D", "tone": "light", "recommended": False},
+    ]
+
+
+@pytest.fixture
+def mock_llm_with_responses():
+    from engine.modules.llm.interface import ActionPlan, ResponseOptions
+    llm = AsyncMock()
+    llm.generate_responses = AsyncMock(return_value=ResponseOptions(options=_make_options()))
+    llm.summarize_call = AsyncMock(return_value={"summary": "Alex agreed to Monday."})
+    return llm
+
+
+@pytest.fixture
+def review_cfg():
+    from engine.config import ReviewConfig
+    return ReviewConfig(timeout_seconds=5.0, auto_select_recommended=True)
+
+
+class TestGeneratingState:
+    async def test_llm_returns_options_then_transitions_to_human_review(self, events, mock_llm_with_responses, review_cfg):
+        collected, broadcast = events
+        orch = Orchestrator(llm=mock_llm_with_responses, broadcast=broadcast, review_config=review_cfg)
+        orch.state = AgentState.GENERATING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="Call Alex", conversation_goal="Schedule meeting"),
+            transcript=[{"speaker": "other", "text": "What time works?", "turn": 0}],
+            turn_number=1,
+        )
+
+        await orch._step()
+
+        assert orch.state == AgentState.HUMAN_REVIEW
+        assert len(orch.ctx.response_options) == 4
+
+    async def test_options_broadcast_emitted(self, events, mock_llm_with_responses, review_cfg):
+        collected, broadcast = events
+        orch = Orchestrator(llm=mock_llm_with_responses, broadcast=broadcast, review_config=review_cfg)
+        orch.state = AgentState.GENERATING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            transcript=[{"speaker": "other", "text": "Hello", "turn": 0}],
+        )
+
+        await orch._step()
+
+        types = [e["type"] for e in collected]
+        assert "options" in types
+
+    async def test_no_llm_transitions_to_error(self, events):
+        collected, broadcast = events
+        orch = Orchestrator(llm=None, broadcast=broadcast)
+        orch.state = AgentState.GENERATING
+        orch.ctx = StateContext(mission=Mission(original_instruction="test"))
+
+        await orch._step()
+
+        assert orch.state == AgentState.ERROR
+        assert "No LLM" in orch.ctx.error_message
+
+    async def test_llm_exception_transitions_to_error(self, events):
+        collected, broadcast = events
+        mock_llm = AsyncMock()
+        mock_llm.generate_responses = AsyncMock(side_effect=Exception("API down"))
+        orch = Orchestrator(llm=mock_llm, broadcast=broadcast)
+        orch.state = AgentState.GENERATING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            transcript=[{"speaker": "other", "text": "hi", "turn": 0}],
+        )
+
+        await orch._step()
+
+        assert orch.state == AgentState.ERROR
+        assert "API down" in orch.ctx.error_message
+
+    async def test_summarization_triggered_after_five_turns(self, events, mock_llm_with_responses, review_cfg):
+        collected, broadcast = events
+        orch = Orchestrator(llm=mock_llm_with_responses, broadcast=broadcast, review_config=review_cfg)
+        orch.state = AgentState.GENERATING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            transcript=[{"speaker": "other", "text": "hi", "turn": i} for i in range(5)],
+            turns_since_summary=4,  # will hit 5 after increment
+        )
+
+        # Pre-emptively queue human_review selection so the test doesn't hang
+        await orch.handle_event({"type": "response_selected", "data": 1})
+        await orch._step()
+
+        # The background task is created; verify summarize_call will eventually be called
+        # (give the event loop a tick to run the task)
+        await asyncio.sleep(0)
+        assert orch.ctx.turns_since_summary == 0  # reset after trigger
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — HUMAN_REVIEW state
+# ---------------------------------------------------------------------------
+
+class TestHumanReviewState:
+    async def test_selection_event_sets_response_and_transitions_to_speaking(self, events, review_cfg):
+        collected, broadcast = events
+        orch = Orchestrator(broadcast=broadcast, review_config=review_cfg)
+        orch.state = AgentState.HUMAN_REVIEW
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            response_options=_make_options(),
+            turn_number=1,
+        )
+
+        await orch.handle_event({"type": "response_selected", "data": 3})
+        await orch._step()
+
+        assert orch.state == AgentState.SPEAKING
+        assert orch.ctx.selected_response == "Option C"
+
+    async def test_timeout_auto_selects_recommended(self, events):
+        collected, broadcast = events
+        cfg = MagicMock()
+        cfg.timeout_seconds = 0.05
+        cfg.auto_select_recommended = True
+        orch = Orchestrator(broadcast=broadcast, review_config=cfg)
+        orch.state = AgentState.HUMAN_REVIEW
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            response_options=_make_options(),
+            turn_number=1,
+        )
+
+        await orch._step()
+
+        assert orch.state == AgentState.SPEAKING
+        # Option 3 is marked recommended
+        assert orch.ctx.selected_response == "Option C"
+
+    async def test_timeout_auto_select_false_picks_first(self, events):
+        collected, broadcast = events
+        cfg = MagicMock()
+        cfg.timeout_seconds = 0.05
+        cfg.auto_select_recommended = False
+        orch = Orchestrator(broadcast=broadcast, review_config=cfg)
+        orch.state = AgentState.HUMAN_REVIEW
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            response_options=_make_options(),
+            turn_number=1,
+        )
+
+        await orch._step()
+
+        assert orch.state == AgentState.SPEAKING
+        assert orch.ctx.selected_response == "Option A"
+
+    async def test_review_started_broadcast_emitted(self, events, review_cfg):
+        collected, broadcast = events
+        orch = Orchestrator(broadcast=broadcast, review_config=review_cfg)
+        orch.state = AgentState.HUMAN_REVIEW
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            response_options=_make_options(),
+        )
+
+        # Pre-load selection so it resolves immediately
+        await orch.handle_event({"type": "response_selected", "data": 1})
+        await orch._step()
+
+        types = [e["type"] for e in collected]
+        assert "review_started" in types
+
+    async def test_selection_broadcasts_response_selected(self, events, review_cfg):
+        collected, broadcast = events
+        orch = Orchestrator(broadcast=broadcast, review_config=review_cfg)
+        orch.state = AgentState.HUMAN_REVIEW
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            response_options=_make_options(),
+        )
+
+        await orch.handle_event({"type": "response_selected", "data": 2})
+        await orch._step()
+
+        sel_events = [e for e in collected if e["type"] == "response_selected"]
+        assert len(sel_events) >= 1
+        assert sel_events[-1]["text"] == "Option B"
+        assert sel_events[-1]["source"] == "human"
