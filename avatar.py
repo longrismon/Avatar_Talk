@@ -140,6 +140,35 @@ async def cmd_plan(instruction: str, dry_run: bool = False, config_path: str = N
     return 0
 
 
+async def cmd_speak(text: str, device: str = None, config_path: str = None) -> int:
+    """Execute the 'speak' subcommand — Phase 2 TTS demo."""
+    from engine.config import load_config
+    from engine.logging_config import setup_logging
+    from engine.modules.audio import create_tts
+    from engine.modules.audio.virtual_devices import inject_audio, get_virtual_mic_device
+
+    cfg_path = config_path or os.environ.get("AVATAR_CONFIG", "engine/config.yaml")
+    config = load_config(cfg_path)
+    setup_logging(level=config.logging.level)
+
+    mic_device = device or get_virtual_mic_device(config.virtual_devices)
+
+    print(f"🎙 Synthesizing: {text!r}")
+    print(f"   TTS: {config.audio.tts.primary}  →  device: {mic_device}")
+
+    tts = create_tts(config.audio)
+    try:
+        audio_stream = tts.synthesize(text)
+        await inject_audio(audio_stream, device=mic_device)
+        print("✅ Done.")
+        return 0
+    except Exception as e:
+        print(f"\n❌ speak failed: {e}", file=sys.stderr)
+        return 1
+    finally:
+        await tts.aclose()
+
+
 async def cmd_health() -> int:
     """Execute the 'health' subcommand."""
     from engine.config import load_config
@@ -193,6 +222,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show plan without executing",
     )
 
+    speak_parser = subparsers.add_parser(
+        "speak",
+        help="[Phase 2] Synthesize text and inject into virtual mic",
+    )
+    speak_parser.add_argument("text", help="Text to speak")
+    speak_parser.add_argument(
+        "--device",
+        metavar="NAME",
+        default=None,
+        help="sounddevice output device name (overrides config)",
+    )
+
     subparsers.add_parser("health", help="Show engine component status")
     subparsers.add_parser("version", help="Show version information")
 
@@ -205,6 +246,8 @@ def main() -> int:
 
     if args.command == "plan":
         return asyncio.run(cmd_plan(args.instruction, dry_run=args.dry_run, config_path=args.config))
+    elif args.command == "speak":
+        return asyncio.run(cmd_speak(args.text, device=args.device, config_path=args.config))
     elif args.command == "health":
         return asyncio.run(cmd_health())
     elif args.command == "version":
