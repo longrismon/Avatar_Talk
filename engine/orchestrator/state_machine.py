@@ -80,6 +80,9 @@ class Orchestrator:
         broadcast: Optional[Callable] = None,
         review_config=None,
         principal_profile: Optional[dict] = None,
+        lipsync=None,
+        lipsync_config=None,
+        virtual_camera_device: Optional[str] = None,
     ):
         """
         Args:
@@ -93,6 +96,9 @@ class Orchestrator:
                        Defaults to a no-op if not provided.
             review_config: ReviewConfig from engine/config.py (Phase 3+)
             principal_profile: dict loaded from profiles/default.json (Phase 3+)
+            lipsync: LipSyncClient instance (Phase 4+)
+            lipsync_config: LipSyncConfig from engine/config.py (Phase 4+)
+            virtual_camera_device: v4l2loopback device path for video injection (Phase 4+)
         """
         self.state = AgentState.IDLE
         self.ctx = StateContext()
@@ -105,6 +111,9 @@ class Orchestrator:
         self._broadcast = broadcast or self._default_broadcast
         self._review_config = review_config
         self._principal_profile = principal_profile or {}
+        self._lipsync = lipsync
+        self._lipsync_config = lipsync_config
+        self._virtual_camera_device = virtual_camera_device
 
         # Event queue: UI events are pushed here, state handlers drain it
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -645,7 +654,7 @@ class Orchestrator:
     async def _handle_speaking(self) -> None:
         text = self.ctx.selected_response
         if not self._tts or not text:
-            log.info("state_speaking", message="[Phase 3] TTS or response not ready")
+            log.info("state_speaking", message="TTS or response not ready")
             await self._transition(AgentState.LISTENING)
             return
 
@@ -653,22 +662,60 @@ class Orchestrator:
         await self._broadcast({"type": "speaking", "text": text})
 
         try:
-            from engine.modules.audio.virtual_devices import inject_audio
-            audio_stream = self._tts.synthesize(text)
-            if self._virtual_mic_device:
-                await inject_audio(audio_stream, device=self._virtual_mic_device)
-            else:
-                async for _ in audio_stream:
-                    pass  # drain without injecting (test/dry-run mode)
+            # Collect full audio first (needed for lip-sync; audio is short enough to buffer)
+            audio_chunks: list[bytes] = []
+            async for chunk in self._tts.synthesize(text):
+                audio_chunks.append(chunk)
+            full_audio = b"".join(audio_chunks)
+
+            # Run audio injection and optional lip-sync video in parallel
+            tasks = [self._inject_audio_bytes(full_audio)]
+            if self._lipsync and self._lipsync_config and self._lipsync_config.enabled:
+                tasks.append(self._inject_lipsync(full_audio))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for r in results:
+                if isinstance(r, Exception):
+                    log.warning("speaking_subtask_error", error=str(r))
 
             self.ctx.selected_response = None
             log.info("speaking_complete")
             await self._broadcast({"type": "speaking_complete"})
             await self._transition(AgentState.LISTENING)
+
         except Exception as exc:
             self.ctx.error_message = f"Speaking failed: {exc}"
             self.ctx.error_source_state = AgentState.SPEAKING
             await self._transition(AgentState.ERROR)
+
+    async def _inject_audio_bytes(self, audio: bytes) -> None:
+        """Inject collected TTS audio bytes to the virtual mic device."""
+        from engine.modules.audio.virtual_devices import inject_audio
+
+        async def _single_chunk():
+            yield audio
+
+        if self._virtual_mic_device:
+            await inject_audio(_single_chunk(), device=self._virtual_mic_device)
+
+    async def _inject_lipsync(self, audio: bytes) -> None:
+        """Generate lip-sync video from audio and push frames to virtual camera."""
+        from engine.modules.lipsync.virtual_camera import inject_video_frames
+
+        video_bytes = await asyncio.wait_for(
+            self._lipsync.generate_video(
+                audio_pcm=audio,
+                reference_image=self._lipsync_config.reference_image,
+            ),
+            timeout=30.0,
+        )
+        if video_bytes and self._virtual_camera_device:
+            await inject_video_frames(
+                video_bytes,
+                device=self._virtual_camera_device,
+                fps=self._lipsync_config.fps,
+            )
 
     async def _handle_manual_override(self) -> None:
         log.info("state_manual_override", message="Manual override active — waiting for resume or end")
