@@ -1,7 +1,7 @@
 """Tests for the Orchestrator state machine — Phase 1 states."""
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from engine.orchestrator.state_machine import AgentState, Orchestrator, StateContext, Mission
 
@@ -459,3 +459,145 @@ class TestHumanReviewState:
         assert len(sel_events) >= 1
         assert sel_events[-1]["text"] == "Option B"
         assert sel_events[-1]["source"] == "human"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — SPEAKING state with lip-sync
+# ---------------------------------------------------------------------------
+
+class TestSpeakingStateWithLipSync:
+    async def _make_tts(self, audio=b"\x00" * 48000):
+        tts = MagicMock()
+
+        async def _synth(text):
+            yield audio
+
+        tts.synthesize = _synth
+        return tts
+
+    async def test_speaking_without_lipsync_transitions_to_listening(self, events):
+        collected, broadcast = events
+        tts = await self._make_tts()
+
+        mock_sd = MagicMock()
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.write = MagicMock()
+        mock_sd.RawOutputStream.return_value = mock_stream
+
+        orch = Orchestrator(tts=tts, broadcast=broadcast, virtual_mic_device=None)
+        orch.state = AgentState.SPEAKING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            selected_response="Hello there.",
+        )
+
+        await orch._step()
+
+        assert orch.state == AgentState.LISTENING
+        assert orch.ctx.selected_response is None
+
+    async def test_speaking_calls_lipsync_generate_video(self, events):
+        collected, broadcast = events
+        tts = await self._make_tts()
+
+        mock_lipsync = AsyncMock()
+        mock_lipsync.generate_video = AsyncMock(return_value=b"\x00\x00\x00\x18ftyp" + b"\x00" * 24)
+
+        mock_lipsync_cfg = MagicMock()
+        mock_lipsync_cfg.enabled = True
+        mock_lipsync_cfg.reference_image = "./face.png"
+        mock_lipsync_cfg.fps = 25
+
+        with patch("engine.modules.lipsync.virtual_camera.inject_video_frames", new=AsyncMock()):
+            orch = Orchestrator(
+                tts=tts,
+                broadcast=broadcast,
+                lipsync=mock_lipsync,
+                lipsync_config=mock_lipsync_cfg,
+                virtual_camera_device="/dev/video10",
+            )
+            orch.state = AgentState.SPEAKING
+            orch.ctx = StateContext(
+                mission=Mission(original_instruction="test"),
+                selected_response="Hi.",
+            )
+
+            await orch._step()
+
+        mock_lipsync.generate_video.assert_awaited_once()
+        assert orch.state == AgentState.LISTENING
+
+    async def test_speaking_lipsync_failure_does_not_crash(self, events):
+        collected, broadcast = events
+        tts = await self._make_tts()
+
+        mock_lipsync = AsyncMock()
+        mock_lipsync.generate_video = AsyncMock(side_effect=Exception("GPU OOM"))
+
+        mock_lipsync_cfg = MagicMock()
+        mock_lipsync_cfg.enabled = True
+        mock_lipsync_cfg.reference_image = "./face.png"
+        mock_lipsync_cfg.fps = 25
+
+        orch = Orchestrator(
+            tts=tts,
+            broadcast=broadcast,
+            lipsync=mock_lipsync,
+            lipsync_config=mock_lipsync_cfg,
+            virtual_camera_device="/dev/video10",
+        )
+        orch.state = AgentState.SPEAKING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            selected_response="Hello.",
+        )
+
+        await orch._step()
+
+        # Despite lipsync failure, should still reach LISTENING
+        assert orch.state == AgentState.LISTENING
+
+    async def test_speaking_lipsync_disabled_skips_video(self, events):
+        collected, broadcast = events
+        tts = await self._make_tts()
+
+        mock_lipsync = AsyncMock()
+
+        mock_lipsync_cfg = MagicMock()
+        mock_lipsync_cfg.enabled = False  # disabled
+
+        orch = Orchestrator(
+            tts=tts,
+            broadcast=broadcast,
+            lipsync=mock_lipsync,
+            lipsync_config=mock_lipsync_cfg,
+        )
+        orch.state = AgentState.SPEAKING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            selected_response="Hello.",
+        )
+
+        await orch._step()
+
+        mock_lipsync.generate_video.assert_not_awaited()
+        assert orch.state == AgentState.LISTENING
+
+    async def test_speaking_broadcasts_speaking_and_complete(self, events):
+        collected, broadcast = events
+        tts = await self._make_tts()
+
+        orch = Orchestrator(tts=tts, broadcast=broadcast)
+        orch.state = AgentState.SPEAKING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="test"),
+            selected_response="Test message.",
+        )
+
+        await orch._step()
+
+        types = [e["type"] for e in collected]
+        assert "speaking" in types
+        assert "speaking_complete" in types

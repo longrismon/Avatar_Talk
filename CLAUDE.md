@@ -37,12 +37,13 @@ Optional dependency groups: `.[stt]` (faster-whisper), `.[tts]` (sounddevice), `
 
 ### Phase status
 
-**Phases 1, 2, and 3 are fully implemented.** Phases 4–6 are stubs.
+**Phases 1–4 are fully implemented.** Phases 5–6 are stubs.
 
 - Phase 1: browser automation, LLM planning, state machine (IDLE→PLANNING→BROWSER_ACTION→CALL_ENDED)
 - Phase 2: full-duplex audio pipeline — Silero VAD, faster-whisper STT, ElevenLabs/Coqui TTS, virtual mic injection
 - Phase 3: LLM response generation (two-temperature), HITL review (ReviewPanel), FastAPI/WebSocket server, React SPA
-- Phases 4–6: lip-sync, mobile notifications, advanced persona — not yet implemented
+- Phase 4: lip-sync — Wav2Lip + SadTalker engines, v4l2loopback virtual camera injection, parallel audio+video during SPEAKING
+- Phases 5–6: mobile notifications, advanced persona — not yet implemented
 
 ### Data flow (Phase 1)
 
