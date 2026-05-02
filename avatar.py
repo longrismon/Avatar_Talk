@@ -194,10 +194,41 @@ async def cmd_health() -> int:
         return 1
 
 
+async def cmd_selector_health(app: str = "teams", config_path: str = None) -> int:
+    """Execute the 'selector-health' subcommand — smoke-test browser selectors."""
+    from engine.config import load_config
+    from engine.modules.browser.health_check import SelectorHealthChecker
+
+    cfg_path = config_path or os.environ.get("AVATAR_CONFIG", "engine/config.yaml")
+    try:
+        config = load_config(cfg_path)
+    except Exception as e:
+        print(f"❌ Config load failed: {e}", file=sys.stderr)
+        return 1
+
+    checker = SelectorHealthChecker()
+    print(f"Checking selectors for '{app}' at {getattr(config.browser.app_urls, app, '?')}...")
+    report = await checker.check(app, config.browser)
+
+    if report.error:
+        print(f"❌ Error: {report.error}")
+        return 1
+
+    width = max(len(r.name) for r in report.results) if report.results else 12
+    for r in report.results:
+        status = "✓" if r.found else "✗"
+        latency = f"{r.latency_ms}ms"
+        err = f"  ({r.error})" if r.error else ""
+        print(f"  {status} {r.name:<{width}}  {latency:>7}{err}")
+
+    print(f"\n  {report.passed} passed, {report.failed} failed")
+    return 0 if report.ok else 1
+
+
 def cmd_version() -> int:
     """Execute the 'version' subcommand."""
     print("Avatar Agent v0.1.0")
-    print("Phase 1 — Browser Automation Foundation")
+    print("Phases 1-6 implemented")
     return 0
 
 
@@ -237,6 +268,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("health", help="Show engine component status")
     subparsers.add_parser("version", help="Show version information")
 
+    health_parser = subparsers.add_parser(
+        "selector-health",
+        help="[Phase 6] Smoke-test browser selectors for a platform app",
+    )
+    health_parser.add_argument(
+        "--app",
+        default="teams",
+        choices=["teams", "slack", "discord"],
+        help="App to check (default: teams)",
+    )
+
     return parser
 
 
@@ -252,6 +294,8 @@ def main() -> int:
         return asyncio.run(cmd_health())
     elif args.command == "version":
         return cmd_version()
+    elif args.command == "selector-health":
+        return asyncio.run(cmd_selector_health(app=args.app, config_path=args.config))
     else:
         parser.print_help()
         return 1

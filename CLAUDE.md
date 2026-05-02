@@ -37,14 +37,14 @@ Optional dependency groups: `.[stt]` (faster-whisper), `.[tts]` (sounddevice), `
 
 ### Phase status
 
-**Phases 1–5 are fully implemented.** Phase 6 is a stub.
+**All phases (1–6) are fully implemented.**
 
 - Phase 1: browser automation, LLM planning, state machine (IDLE→PLANNING→BROWSER_ACTION→CALL_ENDED)
 - Phase 2: full-duplex audio pipeline — Silero VAD, faster-whisper STT, ElevenLabs/Coqui TTS, virtual mic injection
 - Phase 3: LLM response generation (two-temperature), HITL review (ReviewPanel), FastAPI/WebSocket server, React SPA
 - Phase 4: lip-sync — Wav2Lip + SadTalker engines, v4l2loopback virtual camera injection, parallel audio+video during SPEAKING
 - Phase 5: mobile notifications — Firebase FCM push for review_started/intervention_needed/call_connected/call_ended; final call summary on CALL_ENDED
-- Phase 6: advanced persona — not yet implemented
+- Phase 6: polish & hardening — `call_id` in all logs, per-turn PerformanceTracker (p50/p95/p99), adaptive review timeout by conversation phase, speculative LLM pre-generation after SPEAKING, selector health monitor (`python avatar.py selector-health`), one-command virtual device installer (`engine/setup/install_virtual_devices.sh`)
 
 ### Data flow (Phase 1)
 

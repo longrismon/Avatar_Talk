@@ -6,6 +6,7 @@ All other states have stub handlers that log and await further implementation.
 """
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine, Optional
@@ -54,6 +55,8 @@ class StateContext:
     call_summary_so_far: str = ""
     response_options: list[dict] = field(default_factory=list)
     turns_since_summary: int = 0
+    # Phase 6 fields
+    call_id: str = ""
 
 
 class Orchestrator:
@@ -120,6 +123,13 @@ class Orchestrator:
         self._virtual_camera_device = virtual_camera_device
         self._notifier = notifier
         self._notifications_config = notifications_config
+
+        # Phase 6: per-call performance tracking
+        from engine.modules.performance import PerformanceTracker
+        self._perf = PerformanceTracker()
+
+        # Phase 6: speculative LLM pre-generation task (started at end of SPEAKING)
+        self._speculative_task: Optional[asyncio.Task] = None
 
         # Event queue: UI events are pushed here, state handlers drain it
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -223,6 +233,7 @@ class Orchestrator:
             to_state=new_state.value,
             step=self.ctx.current_step_index,
             turn=self.ctx.turn_number,
+            call_id=self.ctx.call_id,
             **meta,
         )
         await self._broadcast({
@@ -291,6 +302,36 @@ class Orchestrator:
             log.warning("notification_failed", notification_event=event_type, error=str(exc))
 
     # -------------------------------------------------------------------------
+    # Phase 6 helpers
+    # -------------------------------------------------------------------------
+
+    def _conversation_phase(self) -> str:
+        """Classify where we are in the call for adaptive timeout tuning.
+
+        Returns "early" (turns 0-4), "mid" (5-14), or "late" (15+).
+        """
+        t = self.ctx.turn_number
+        if t < 5:
+            return "early"
+        if t < 15:
+            return "mid"
+        return "late"
+
+    def _adaptive_review_timeout(self, base_timeout: float) -> float:
+        """Scale the review timeout based on conversation phase.
+
+        Early calls need more time (principal is still calibrating); late calls
+        are faster because the principal has built a rhythm.
+        """
+        multipliers = {"early": 1.5, "mid": 1.0, "late": 0.75}
+        return base_timeout * multipliers[self._conversation_phase()]
+
+    @property
+    def perf(self):
+        """Public accessor for the PerformanceTracker (for testing and dashboard)."""
+        return self._perf
+
+    # -------------------------------------------------------------------------
     # State handlers — Phase 1 (fully implemented)
     # -------------------------------------------------------------------------
 
@@ -300,9 +341,14 @@ class Orchestrator:
         await self._broadcast({"type": "idle", "message": "Ready for instructions"})
 
         instruction = await self._wait_for_event("user_instruction", timeout=86400.0)
-        log.info("instruction_received", instruction=instruction)
+        call_id = uuid.uuid4().hex[:8]
+        log.info("instruction_received", instruction=instruction, call_id=call_id)
 
-        self.ctx = StateContext(mission=Mission(original_instruction=instruction))
+        self.ctx = StateContext(
+            mission=Mission(original_instruction=instruction),
+            call_id=call_id,
+            call_start_time=time.monotonic(),
+        )
         await self._transition(AgentState.PLANNING)
 
     async def _handle_planning(self) -> None:
@@ -555,9 +601,12 @@ class Orchestrator:
                     }
                     self.ctx.transcript.append(turn)
                     self.ctx.turn_number += 1
+                    self._perf.start_turn(self.ctx.call_id, self.ctx.turn_number)
+                    self._perf.record("utterance_end")
                     log.info(
                         "utterance_received",
                         turn=self.ctx.turn_number,
+                        call_id=self.ctx.call_id,
                         preview=final.text[:80],
                     )
                     await self._broadcast({
@@ -584,7 +633,7 @@ class Orchestrator:
             return
 
         await self._broadcast({"type": "generating"})
-        log.info("state_generating", turn=self.ctx.turn_number)
+        log.info("state_generating", turn=self.ctx.turn_number, call_id=self.ctx.call_id)
 
         recent_turns = self.ctx.transcript[-8:]
         context_payload = {
@@ -596,21 +645,34 @@ class Orchestrator:
             "current_utterance": recent_turns[-1]["text"] if recent_turns else "",
         }
 
-        try:
-            options_result = await asyncio.wait_for(
-                self._llm.generate_responses(context_payload),
-                timeout=15.0,
-            )
-        except asyncio.TimeoutError:
-            self.ctx.error_message = "Response generation timed out"
-            self.ctx.error_source_state = AgentState.GENERATING
-            await self._transition(AgentState.ERROR)
-            return
-        except Exception as exc:
-            self.ctx.error_message = f"Response generation failed: {exc}"
-            self.ctx.error_source_state = AgentState.GENERATING
-            await self._transition(AgentState.ERROR)
-            return
+        # Check if a speculative result is already available (started at end of previous SPEAKING)
+        options_result = None
+        if self._speculative_task is not None and self._speculative_task.done():
+            try:
+                options_result = self._speculative_task.result()
+                log.info("speculative_result_used", turn=self.ctx.turn_number, call_id=self.ctx.call_id)
+            except Exception:
+                options_result = None
+            self._speculative_task = None
+
+        if options_result is None:
+            self._perf.record("llm_start")
+            try:
+                options_result = await asyncio.wait_for(
+                    self._llm.generate_responses(context_payload),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                self.ctx.error_message = "Response generation timed out"
+                self.ctx.error_source_state = AgentState.GENERATING
+                await self._transition(AgentState.ERROR)
+                return
+            except Exception as exc:
+                self.ctx.error_message = f"Response generation failed: {exc}"
+                self.ctx.error_source_state = AgentState.GENERATING
+                await self._transition(AgentState.ERROR)
+                return
+            self._perf.record("llm_complete")
 
         self.ctx.response_options = options_result.options
 
@@ -643,8 +705,38 @@ class Orchestrator:
         except Exception as exc:
             log.warning("summarization_failed", error=str(exc))
 
+    async def _run_speculative_generation(self):
+        """Background task: start LLM response generation speculatively.
+
+        Called immediately after SPEAKING completes, before the other party
+        has finished their next utterance.  Uses the current transcript context
+        (no current_utterance) so the result may be stale, but in most turns
+        the conversational direction is predictable from context.
+
+        The result is consumed in _handle_generating if the task is done by
+        the time the utterance ends — giving effectively zero LLM wait time.
+        """
+        try:
+            recent_turns = self.ctx.transcript[-8:]
+            context_payload = {
+                "principal_profile": self._principal_profile,
+                "mission_goal": self.ctx.mission.conversation_goal if self.ctx.mission else "",
+                "success_criteria": self.ctx.mission.success_criteria if self.ctx.mission else "",
+                "call_summary_so_far": self.ctx.call_summary_so_far,
+                "recent_turns": recent_turns,
+                "current_utterance": "",  # speculative — utterance not yet known
+            }
+            return await asyncio.wait_for(
+                self._llm.generate_responses(context_payload),
+                timeout=15.0,
+            )
+        except Exception as exc:
+            log.debug("speculative_generation_failed", error=str(exc))
+            return None
+
     async def _handle_human_review(self) -> None:
-        timeout = self._review_config.timeout_seconds if self._review_config else 5.0
+        base_timeout = self._review_config.timeout_seconds if self._review_config else 5.0
+        timeout = self._adaptive_review_timeout(base_timeout)
         auto_select = self._review_config.auto_select_recommended if self._review_config else True
 
         await self._broadcast({
@@ -707,8 +799,12 @@ class Orchestrator:
         try:
             # Collect full audio first (needed for lip-sync; audio is short enough to buffer)
             audio_chunks: list[bytes] = []
+            first_chunk = True
             async for chunk in self._tts.synthesize(text):
                 audio_chunks.append(chunk)
+                if first_chunk:
+                    self._perf.record("tts_first_chunk")
+                    first_chunk = False
             full_audio = b"".join(audio_chunks)
 
             # Run audio injection and optional lip-sync video in parallel
@@ -723,8 +819,20 @@ class Orchestrator:
                     log.warning("speaking_subtask_error", error=str(r))
 
             self.ctx.selected_response = None
-            log.info("speaking_complete")
+            self._perf.record("speaking_complete")
+            log.info("speaking_complete", call_id=self.ctx.call_id,
+                     e2e_ms=self._perf._current.end_to_end_latency_ms if self._perf._current else 0)
             await self._broadcast({"type": "speaking_complete"})
+
+            # Kick off speculative LLM pre-generation for the next expected response.
+            # This call uses the current transcript (without the next utterance) so the
+            # result may be used as a fast-path in _handle_generating if it finishes
+            # before the other party finishes speaking.
+            if self._llm:
+                self._speculative_task = asyncio.create_task(
+                    self._run_speculative_generation()
+                )
+
             await self._transition(AgentState.LISTENING)
 
         except Exception as exc:
