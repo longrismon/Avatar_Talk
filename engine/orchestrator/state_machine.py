@@ -49,7 +49,11 @@ class StateContext:
     call_start_time: Optional[float] = None
     error_source_state: Optional[AgentState] = None
     error_message: Optional[str] = None
-    selected_response: Optional[str] = None  # set by HUMAN_REVIEW (Phase 3)
+    selected_response: Optional[str] = None
+    # Phase 3 fields
+    call_summary_so_far: str = ""
+    response_options: list[dict] = field(default_factory=list)
+    turns_since_summary: int = 0
 
 
 class Orchestrator:
@@ -74,6 +78,8 @@ class Orchestrator:
         vad=None,
         virtual_mic_device: Optional[str] = None,
         broadcast: Optional[Callable] = None,
+        review_config=None,
+        principal_profile: Optional[dict] = None,
     ):
         """
         Args:
@@ -85,6 +91,8 @@ class Orchestrator:
             virtual_mic_device: sounddevice device name for TTS injection (Phase 2+)
             broadcast: Async callable that receives event dicts to send to connected UIs.
                        Defaults to a no-op if not provided.
+            review_config: ReviewConfig from engine/config.py (Phase 3+)
+            principal_profile: dict loaded from profiles/default.json (Phase 3+)
         """
         self.state = AgentState.IDLE
         self.ctx = StateContext()
@@ -95,6 +103,8 @@ class Orchestrator:
         self._vad = vad
         self._virtual_mic_device = virtual_mic_device
         self._broadcast = broadcast or self._default_broadcast
+        self._review_config = review_config
+        self._principal_profile = principal_profile or {}
 
         # Event queue: UI events are pushed here, state handlers drain it
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -521,12 +531,116 @@ class Orchestrator:
             await self._transition(AgentState.ERROR)
 
     async def _handle_generating(self) -> None:
-        log.info("state_generating", message="[Phase 3] LLM response generation not yet implemented")
-        await self._transition(AgentState.CALL_ENDED)
+        if not self._llm:
+            self.ctx.error_message = "No LLM configured"
+            self.ctx.error_source_state = AgentState.GENERATING
+            await self._transition(AgentState.ERROR)
+            return
+
+        await self._broadcast({"type": "generating"})
+        log.info("state_generating", turn=self.ctx.turn_number)
+
+        recent_turns = self.ctx.transcript[-8:]
+        context_payload = {
+            "principal_profile": self._principal_profile,
+            "mission_goal": self.ctx.mission.conversation_goal if self.ctx.mission else "",
+            "success_criteria": self.ctx.mission.success_criteria if self.ctx.mission else "",
+            "call_summary_so_far": self.ctx.call_summary_so_far,
+            "recent_turns": recent_turns,
+            "current_utterance": recent_turns[-1]["text"] if recent_turns else "",
+        }
+
+        try:
+            options_result = await asyncio.wait_for(
+                self._llm.generate_responses(context_payload),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            self.ctx.error_message = "Response generation timed out"
+            self.ctx.error_source_state = AgentState.GENERATING
+            await self._transition(AgentState.ERROR)
+            return
+        except Exception as exc:
+            self.ctx.error_message = f"Response generation failed: {exc}"
+            self.ctx.error_source_state = AgentState.GENERATING
+            await self._transition(AgentState.ERROR)
+            return
+
+        self.ctx.response_options = options_result.options
+
+        # Background summarization every 5 turns
+        self.ctx.turns_since_summary += 1
+        if self.ctx.turns_since_summary >= 5:
+            asyncio.create_task(self._run_summarization())
+            self.ctx.turns_since_summary = 0
+
+        await self._broadcast({
+            "type": "options",
+            "options": self.ctx.response_options,
+            "turn": self.ctx.turn_number,
+        })
+        await self._transition(AgentState.HUMAN_REVIEW)
+
+    async def _run_summarization(self) -> None:
+        """Background task: update call_summary_so_far via LLM."""
+        try:
+            mission_dict = {
+                "conversation_goal": self.ctx.mission.conversation_goal if self.ctx.mission else "",
+                "summary": self.ctx.call_summary_so_far,
+            }
+            result = await asyncio.wait_for(
+                self._llm.summarize_call(self.ctx.transcript, mission_dict),
+                timeout=10.0,
+            )
+            self.ctx.call_summary_so_far = result.get("summary", "")
+            log.info("summarization_complete", preview=self.ctx.call_summary_so_far[:80])
+        except Exception as exc:
+            log.warning("summarization_failed", error=str(exc))
 
     async def _handle_human_review(self) -> None:
-        log.info("state_human_review", message="[Phase 3] HITL not yet implemented")
-        await self._transition(AgentState.CALL_ENDED)
+        timeout = self._review_config.timeout_seconds if self._review_config else 5.0
+        auto_select = self._review_config.auto_select_recommended if self._review_config else True
+
+        await self._broadcast({
+            "type": "review_started",
+            "options": self.ctx.response_options,
+            "timeout_seconds": timeout,
+            "turn": self.ctx.turn_number,
+        })
+        log.info("state_human_review", timeout=timeout)
+
+        try:
+            selected_id = await self._wait_for_event("response_selected", timeout=timeout)
+            option = next(
+                (o for o in self.ctx.response_options if o["id"] == selected_id), None
+            )
+            selected_text = option["text"] if option else self.ctx.response_options[0]["text"]
+            selection_source = "human"
+        except asyncio.TimeoutError:
+            if auto_select:
+                rec = next(
+                    (o for o in self.ctx.response_options if o.get("recommended")),
+                    self.ctx.response_options[0] if self.ctx.response_options else None,
+                )
+                selected_text = rec["text"] if rec else ""
+                selection_source = "auto"
+            else:
+                selected_text = self.ctx.response_options[0]["text"] if self.ctx.response_options else ""
+                selection_source = "auto_first"
+
+        self.ctx.selected_response = selected_text
+        log.info(
+            "response_selected",
+            source=selection_source,
+            turn=self.ctx.turn_number,
+            preview=selected_text[:60],
+        )
+        await self._broadcast({
+            "type": "response_selected",
+            "text": selected_text,
+            "source": selection_source,
+        })
+        await self._transition(AgentState.SPEAKING)
 
     async def _handle_speaking(self) -> None:
         text = self.ctx.selected_response

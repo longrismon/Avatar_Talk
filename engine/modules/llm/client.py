@@ -61,6 +61,12 @@ def repair_llm_response(raw: str) -> dict:
     return data
 
 
+_REC_SYSTEM = (
+    "Given these response options and the conversation goal, respond with only a JSON "
+    "object: {\"recommended_id\": <1-4>}. Pick the option that best advances the goal."
+)
+
+
 class AnthropicLLM(LLMClient):
     """Claude API client via Anthropic's Messages API."""
 
@@ -91,29 +97,34 @@ class AnthropicLLM(LLMClient):
             self._planning_prompt = _load_prompt("planning")
         return self._planning_prompt
 
+    async def _chat(self, system: str, user: str, temperature: float, max_tokens: int) -> str:
+        """Single Anthropic Messages API call; returns the assistant text."""
+        response = await self._get_client().post(
+            self.API_URL,
+            json={
+                "model": self._model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            },
+        )
+        response.raise_for_status()
+        return response.json()["content"][0]["text"]
+
     async def generate_plan(self, instruction: str, available_apps: list[str]) -> ActionPlan:
         """Call Claude to decompose instruction into action steps."""
         payload = {
             "instruction": instruction,
             "available_apps": available_apps,
         }
-        response = await self._get_client().post(
-            self.API_URL,
-            json={
-                "model": self._model,
-                "max_tokens": 1000,
-                "temperature": 0.3,
-                "system": self._get_planning_prompt(),
-                "messages": [
-                    {"role": "user", "content": json.dumps(payload)}
-                ],
-            },
+        raw_text = await self._chat(
+            system=self._get_planning_prompt(),
+            user=json.dumps(payload),
+            temperature=0.3,
+            max_tokens=1000,
         )
-        response.raise_for_status()
-        data = response.json()
-        raw_text = data["content"][0]["text"]
         parsed = repair_llm_response(raw_text)
-
         return ActionPlan(
             steps=parsed.get("steps", []),
             mission_summary=parsed.get("mission_summary", ""),
@@ -123,10 +134,59 @@ class AnthropicLLM(LLMClient):
         )
 
     async def generate_responses(self, context_payload: dict) -> ResponseOptions:
-        raise NotImplementedError("generate_responses is implemented in Phase 3")
+        """Two-temperature response generation: diversity pass + deterministic recommendation."""
+        # Call 1 — diversity pass
+        raw_options = await self._chat(
+            system=_load_prompt("conversation"),
+            user=json.dumps(context_payload),
+            temperature=0.7,
+            max_tokens=800,
+        )
+        data = repair_llm_response(raw_options)
+
+        # Call 2 — deterministic recommendation
+        rec_payload = {
+            "options": data["options"],
+            "mission_goal": context_payload.get("mission_goal", ""),
+            "current_utterance": context_payload.get("current_utterance", ""),
+        }
+        try:
+            raw_rec = await self._chat(
+                system=_REC_SYSTEM,
+                user=json.dumps(rec_payload),
+                temperature=0.0,
+                max_tokens=50,
+            )
+            rec = json.loads(raw_rec)
+            rec_id = int(rec.get("recommended_id", 1))
+            for opt in data["options"]:
+                opt["recommended"] = (opt["id"] == rec_id)
+            # Ensure exactly one recommended
+            if not any(opt["recommended"] for opt in data["options"]):
+                data["options"][0]["recommended"] = True
+        except Exception:
+            pass  # repair_llm_response already ensured one recommended=True
+
+        return ResponseOptions(options=data["options"])
 
     async def summarize_call(self, transcript: list[dict], mission: dict) -> dict:
-        raise NotImplementedError("summarize_call is implemented in Phase 5")
+        """Summarize the call so far into 2-3 sentences."""
+        payload = {
+            "mission_goal": mission.get("conversation_goal", ""),
+            "turns": transcript,
+            "previous_summary": mission.get("summary", ""),
+        }
+        raw = await self._chat(
+            system=_load_prompt("summary"),
+            user=json.dumps(payload),
+            temperature=0.0,
+            max_tokens=200,
+        )
+        try:
+            result = json.loads(raw)
+            return {"summary": result.get("summary", raw)}
+        except Exception:
+            return {"summary": raw.strip()}
 
     async def aclose(self) -> None:
         """Close the HTTP client."""
@@ -152,26 +212,33 @@ class OllamaLLM(LLMClient):
             )
         return self._client
 
-    async def generate_plan(self, instruction: str, available_apps: list[str]) -> ActionPlan:
-        payload = {
-            "instruction": instruction,
-            "available_apps": available_apps,
-        }
-        planning_prompt = _load_prompt("planning")
+    async def _chat(self, system: str, user: str, temperature: float, max_tokens: int) -> str:
         response = await self._get_client().post(
             "/api/chat",
             json={
                 "model": self._model,
                 "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
                 "messages": [
-                    {"role": "system", "content": planning_prompt},
-                    {"role": "user", "content": json.dumps(payload)},
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
                 ],
             },
         )
         response.raise_for_status()
-        data = response.json()
-        raw_text = data["message"]["content"]
+        return response.json()["message"]["content"]
+
+    async def generate_plan(self, instruction: str, available_apps: list[str]) -> ActionPlan:
+        payload = {
+            "instruction": instruction,
+            "available_apps": available_apps,
+        }
+        raw_text = await self._chat(
+            system=_load_prompt("planning"),
+            user=json.dumps(payload),
+            temperature=0.3,
+            max_tokens=1000,
+        )
         parsed = repair_llm_response(raw_text)
         return ActionPlan(
             steps=parsed.get("steps", []),
@@ -182,10 +249,54 @@ class OllamaLLM(LLMClient):
         )
 
     async def generate_responses(self, context_payload: dict) -> ResponseOptions:
-        raise NotImplementedError("generate_responses is implemented in Phase 3")
+        raw_options = await self._chat(
+            system=_load_prompt("conversation"),
+            user=json.dumps(context_payload),
+            temperature=0.7,
+            max_tokens=800,
+        )
+        data = repair_llm_response(raw_options)
+
+        rec_payload = {
+            "options": data["options"],
+            "mission_goal": context_payload.get("mission_goal", ""),
+            "current_utterance": context_payload.get("current_utterance", ""),
+        }
+        try:
+            raw_rec = await self._chat(
+                system=_REC_SYSTEM,
+                user=json.dumps(rec_payload),
+                temperature=0.0,
+                max_tokens=50,
+            )
+            rec = json.loads(raw_rec)
+            rec_id = int(rec.get("recommended_id", 1))
+            for opt in data["options"]:
+                opt["recommended"] = (opt["id"] == rec_id)
+            if not any(opt["recommended"] for opt in data["options"]):
+                data["options"][0]["recommended"] = True
+        except Exception:
+            pass
+
+        return ResponseOptions(options=data["options"])
 
     async def summarize_call(self, transcript: list[dict], mission: dict) -> dict:
-        raise NotImplementedError("summarize_call is implemented in Phase 5")
+        payload = {
+            "mission_goal": mission.get("conversation_goal", ""),
+            "turns": transcript,
+            "previous_summary": mission.get("summary", ""),
+        }
+        raw = await self._chat(
+            system=_load_prompt("summary"),
+            user=json.dumps(payload),
+            temperature=0.0,
+            max_tokens=200,
+        )
+        try:
+            result = json.loads(raw)
+            return {"summary": result.get("summary", raw)}
+        except Exception:
+            return {"summary": raw.strip()}
 
     async def aclose(self) -> None:
         if self._client:
@@ -221,22 +332,30 @@ class CustomLLM(LLMClient):
             self._planning_prompt = _load_prompt("planning")
         return self._planning_prompt
 
-    async def generate_plan(self, instruction: str, available_apps: list[str]) -> ActionPlan:
-        payload = {"instruction": instruction, "available_apps": available_apps}
+    async def _chat(self, system: str, user: str, temperature: float, max_tokens: int) -> str:
         response = await self._get_client().post(
             "/chat/completions",
             json={
                 "model": self._model,
-                "temperature": 0.3,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
                 "messages": [
-                    {"role": "system", "content": self._get_planning_prompt()},
-                    {"role": "user", "content": json.dumps(payload)},
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
                 ],
             },
         )
         response.raise_for_status()
-        data = response.json()
-        raw_text = data["choices"][0]["message"]["content"]
+        return response.json()["choices"][0]["message"]["content"]
+
+    async def generate_plan(self, instruction: str, available_apps: list[str]) -> ActionPlan:
+        payload = {"instruction": instruction, "available_apps": available_apps}
+        raw_text = await self._chat(
+            system=self._get_planning_prompt(),
+            user=json.dumps(payload),
+            temperature=0.3,
+            max_tokens=1000,
+        )
         parsed = repair_llm_response(raw_text)
         return ActionPlan(
             steps=parsed.get("steps", []),
@@ -247,10 +366,54 @@ class CustomLLM(LLMClient):
         )
 
     async def generate_responses(self, context_payload: dict) -> ResponseOptions:
-        raise NotImplementedError("generate_responses is implemented in Phase 3")
+        raw_options = await self._chat(
+            system=_load_prompt("conversation"),
+            user=json.dumps(context_payload),
+            temperature=0.7,
+            max_tokens=800,
+        )
+        data = repair_llm_response(raw_options)
+
+        rec_payload = {
+            "options": data["options"],
+            "mission_goal": context_payload.get("mission_goal", ""),
+            "current_utterance": context_payload.get("current_utterance", ""),
+        }
+        try:
+            raw_rec = await self._chat(
+                system=_REC_SYSTEM,
+                user=json.dumps(rec_payload),
+                temperature=0.0,
+                max_tokens=50,
+            )
+            rec = json.loads(raw_rec)
+            rec_id = int(rec.get("recommended_id", 1))
+            for opt in data["options"]:
+                opt["recommended"] = (opt["id"] == rec_id)
+            if not any(opt["recommended"] for opt in data["options"]):
+                data["options"][0]["recommended"] = True
+        except Exception:
+            pass
+
+        return ResponseOptions(options=data["options"])
 
     async def summarize_call(self, transcript: list[dict], mission: dict) -> dict:
-        raise NotImplementedError("summarize_call is implemented in Phase 5")
+        payload = {
+            "mission_goal": mission.get("conversation_goal", ""),
+            "turns": transcript,
+            "previous_summary": mission.get("summary", ""),
+        }
+        raw = await self._chat(
+            system=_load_prompt("summary"),
+            user=json.dumps(payload),
+            temperature=0.0,
+            max_tokens=200,
+        )
+        try:
+            result = json.loads(raw)
+            return {"summary": result.get("summary", raw)}
+        except Exception:
+            return {"summary": raw.strip()}
 
     async def aclose(self) -> None:
         if self._client:
