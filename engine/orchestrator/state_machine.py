@@ -83,6 +83,8 @@ class Orchestrator:
         lipsync=None,
         lipsync_config=None,
         virtual_camera_device: Optional[str] = None,
+        notifier=None,
+        notifications_config=None,
     ):
         """
         Args:
@@ -99,6 +101,8 @@ class Orchestrator:
             lipsync: LipSyncClient instance (Phase 4+)
             lipsync_config: LipSyncConfig from engine/config.py (Phase 4+)
             virtual_camera_device: v4l2loopback device path for video injection (Phase 4+)
+            notifier: NotificationClient instance (Phase 5+)
+            notifications_config: NotificationsConfig from engine/config.py (Phase 5+)
         """
         self.state = AgentState.IDLE
         self.ctx = StateContext()
@@ -114,6 +118,8 @@ class Orchestrator:
         self._lipsync = lipsync
         self._lipsync_config = lipsync_config
         self._virtual_camera_device = virtual_camera_device
+        self._notifier = notifier
+        self._notifications_config = notifications_config
 
         # Event queue: UI events are pushed here, state handlers drain it
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -263,6 +269,26 @@ class Orchestrator:
         except asyncio.TimeoutError:
             self._pending_events.pop(event_type, None)
             raise
+
+    async def _notify(
+        self,
+        event_type: str,
+        title: str,
+        body: str,
+        data: dict | None = None,
+    ) -> None:
+        """Send a push notification if enabled and the event type is subscribed."""
+        if not self._notifier:
+            return
+        cfg = self._notifications_config
+        if not cfg or not cfg.push_enabled:
+            return
+        if event_type not in (cfg.events or []):
+            return
+        try:
+            await self._notifier.send(title=title, body=body, data=data or {})
+        except Exception as exc:
+            log.warning("notification_failed", notification_event=event_type, error=str(exc))
 
     # -------------------------------------------------------------------------
     # State handlers — Phase 1 (fully implemented)
@@ -417,6 +443,12 @@ class Orchestrator:
                 "message": result.error,
                 "screenshot": result.screenshot_path,
             })
+            await self._notify(
+                "intervention_needed",
+                "Manual Intervention Required",
+                f"Step {step_num} ({step['action']}) needs attention",
+                {"step": str(step_num), "action": step["action"]},
+            )
 
             # Wait for user response (retry/skip/abort)
             try:
@@ -469,6 +501,11 @@ class Orchestrator:
         # For now, wait for a manual event or transition to CALL_ENDED.
         try:
             event = await self._wait_for_event("call_connected", timeout=60.0)
+            await self._notify(
+                "call_connected",
+                "Call Connected",
+                "The call has been connected. AI avatar is now active.",
+            )
             await self._transition(AgentState.LISTENING)
         except asyncio.TimeoutError:
             log.info("awaiting_call_timeout")
@@ -616,6 +653,12 @@ class Orchestrator:
             "timeout_seconds": timeout,
             "turn": self.ctx.turn_number,
         })
+        await self._notify(
+            "review_started",
+            "Response Review",
+            f"Select a response for turn {self.ctx.turn_number} ({timeout}s to auto-select)",
+            {"turn": str(self.ctx.turn_number), "timeout": str(int(timeout))},
+        )
         log.info("state_human_review", timeout=timeout)
 
         try:
@@ -730,13 +773,39 @@ class Orchestrator:
             await self._transition(AgentState.CALL_ENDED)
 
     async def _handle_call_ended(self) -> None:
-        """CALL_ENDED: log summary and reset to IDLE."""
+        """CALL_ENDED: generate final summary, send notification, reset to IDLE."""
         log.info("state_call_ended", turn_count=self.ctx.turn_number)
+
+        # Generate final call summary if LLM and transcript are available
+        final_summary = self.ctx.call_summary_so_far
+        if self._llm and self.ctx.transcript:
+            try:
+                mission_dict = {
+                    "conversation_goal": self.ctx.mission.conversation_goal if self.ctx.mission else "",
+                    "summary": self.ctx.call_summary_so_far,
+                }
+                result = await asyncio.wait_for(
+                    self._llm.summarize_call(self.ctx.transcript, mission_dict),
+                    timeout=10.0,
+                )
+                final_summary = result.get("summary", self.ctx.call_summary_so_far)
+                log.info("final_summary_complete", preview=final_summary[:80])
+            except Exception as exc:
+                log.warning("final_summary_failed", error=str(exc))
+
         await self._broadcast({
             "type": "call_ended",
             "turn_count": self.ctx.turn_number,
             "mission_summary": self.ctx.mission.summary if self.ctx.mission else None,
+            "final_summary": final_summary,
         })
+        await self._notify(
+            "call_ended",
+            "Call Ended",
+            final_summary or f"Call completed after {self.ctx.turn_number} turns",
+            {"turn_count": str(self.ctx.turn_number)},
+        )
+
         self.ctx = StateContext()
         await self._transition(AgentState.IDLE)
 
