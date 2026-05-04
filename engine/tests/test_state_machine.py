@@ -601,3 +601,84 @@ class TestSpeakingStateWithLipSync:
         types = [e["type"] for e in collected]
         assert "speaking" in types
         assert "speaking_complete" in types
+
+
+class TestSpeakingStateBargeIn:
+    """Barge-in detection during SPEAKING state."""
+
+    def _make_vad_result(self, is_speech=True, probability=0.9):
+        from engine.modules.audio.vad import VADResult
+        return VADResult(is_speech=is_speech, probability=probability, utterance_complete=False)
+
+    def _make_tts(self):
+        tts = MagicMock()
+
+        async def _synth(text):
+            # One 100ms chunk of silence (3200 bytes at 16kHz/16-bit)
+            yield b"\x00" * 3200
+
+        tts.synthesize = _synth
+        return tts
+
+    def _make_vad_cfg(self, barge_in_enabled=True, threshold=0.3):
+        cfg = MagicMock()
+        cfg.barge_in_enabled = barge_in_enabled
+        cfg.barge_in_threshold = threshold
+        return cfg
+
+    def _make_orch(self, barge_in_enabled=True, broadcast=None):
+        mock_vad = MagicMock()
+        mock_vad.process_chunk.return_value = []  # no speech by default
+
+        orch = Orchestrator(
+            tts=self._make_tts(),
+            vad=mock_vad,
+            vad_config=self._make_vad_cfg(barge_in_enabled=barge_in_enabled),
+            broadcast=broadcast,
+        )
+        orch.state = AgentState.SPEAKING
+        orch.ctx = StateContext(
+            mission=Mission(original_instruction="x"),
+            selected_response="Hello there.",
+        )
+        return orch, mock_vad
+
+    async def test_no_barge_in_transitions_to_listening(self):
+        orch, _ = self._make_orch()
+        await orch._step()
+        assert orch.state == AgentState.LISTENING
+
+    async def test_barge_in_detected_transitions_to_listening(self):
+        orch, mock_vad = self._make_orch()
+        mock_vad.process_chunk.return_value = [self._make_vad_result()]
+        await orch.handle_event({"type": "audio_chunk", "data": b"\x00" * 320})
+        await orch._step()
+        assert orch.state == AgentState.LISTENING
+
+    async def test_barge_in_broadcasts_barge_in_event(self, events):
+        collected, broadcast = events
+        orch, mock_vad = self._make_orch(broadcast=broadcast)
+        mock_vad.process_chunk.return_value = [self._make_vad_result()]
+        await orch.handle_event({"type": "audio_chunk", "data": b"\x00" * 320})
+        await orch._step()
+        types = [e["type"] for e in collected]
+        assert "barge_in" in types
+
+    async def test_barge_in_skips_speculative_generation(self):
+        mock_llm = AsyncMock()
+        orch, mock_vad = self._make_orch()
+        orch._llm = mock_llm
+        mock_vad.process_chunk.return_value = [self._make_vad_result()]
+        await orch.handle_event({"type": "audio_chunk", "data": b"\x00" * 320})
+        await orch._step()
+        assert orch._speculative_task is None
+
+    async def test_barge_in_disabled_completes_normally(self, events):
+        collected, broadcast = events
+        orch, mock_vad = self._make_orch(barge_in_enabled=False, broadcast=broadcast)
+        mock_vad.process_chunk.return_value = [self._make_vad_result()]
+        await orch.handle_event({"type": "audio_chunk", "data": b"\x00" * 320})
+        await orch._step()
+        assert orch.state == AgentState.LISTENING
+        types = [e["type"] for e in collected]
+        assert "barge_in" not in types
