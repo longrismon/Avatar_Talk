@@ -88,6 +88,7 @@ class Orchestrator:
         virtual_camera_device: Optional[str] = None,
         notifier=None,
         notifications_config=None,
+        vad_config=None,
     ):
         """
         Args:
@@ -106,6 +107,7 @@ class Orchestrator:
             virtual_camera_device: v4l2loopback device path for video injection (Phase 4+)
             notifier: NotificationClient instance (Phase 5+)
             notifications_config: NotificationsConfig from engine/config.py (Phase 5+)
+            vad_config: VADConfig from engine/config.py (barge-in settings)
         """
         self.state = AgentState.IDLE
         self.ctx = StateContext()
@@ -123,6 +125,7 @@ class Orchestrator:
         self._virtual_camera_device = virtual_camera_device
         self._notifier = notifier
         self._notifications_config = notifications_config
+        self._vad_config = vad_config
 
         # Phase 6: per-call performance tracking
         from engine.modules.performance import PerformanceTracker
@@ -807,28 +810,58 @@ class Orchestrator:
                     first_chunk = False
             full_audio = b"".join(audio_chunks)
 
-            # Run audio injection and optional lip-sync video in parallel
-            tasks = [self._inject_audio_bytes(full_audio)]
+            barge_in_event = asyncio.Event()
+            barge_in_enabled = (
+                self._vad is not None
+                and self._vad_config is not None
+                and self._vad_config.barge_in_enabled
+            )
+
+            inject_task = asyncio.create_task(
+                self._inject_audio_bytes(full_audio, barge_in_event)
+            )
+            lipsync_task = None
             if self._lipsync and self._lipsync_config and self._lipsync_config.enabled:
-                tasks.append(self._inject_lipsync(full_audio))
+                lipsync_task = asyncio.create_task(self._inject_lipsync(full_audio))
+            monitor_task = None
+            if barge_in_enabled:
+                monitor_task = asyncio.create_task(self._monitor_barge_in(barge_in_event))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Wait for injection to finish (generator stops early if barge_in_event set)
+            await asyncio.gather(inject_task, return_exceptions=True)
+            # Yield once so the monitor can process any audio_chunk already in the
+            # buffer before we decide whether a barge-in was detected.
+            await asyncio.sleep(0)
+            barged_in = barge_in_event.is_set()
 
-            for r in results:
-                if isinstance(r, Exception):
-                    log.warning("speaking_subtask_error", error=str(r))
+            # Cancel monitor — done regardless of outcome
+            if monitor_task:
+                monitor_task.cancel()
+                await asyncio.gather(monitor_task, return_exceptions=True)
+
+            # On barge-in cancel lipsync immediately; otherwise wait for it to finish
+            if lipsync_task:
+                if barged_in:
+                    lipsync_task.cancel()
+                result = await asyncio.gather(lipsync_task, return_exceptions=True)
+                if not barged_in and isinstance(result[0], Exception):
+                    log.warning("speaking_subtask_error", error=str(result[0]))
 
             self.ctx.selected_response = None
             self._perf.record("speaking_complete")
-            log.info("speaking_complete", call_id=self.ctx.call_id,
-                     e2e_ms=self._perf._current.end_to_end_latency_ms if self._perf._current else 0)
+            log.info(
+                "speaking_complete",
+                call_id=self.ctx.call_id,
+                barge_in=barged_in,
+                e2e_ms=self._perf._current.end_to_end_latency_ms if self._perf._current else 0,
+            )
             await self._broadcast({"type": "speaking_complete"})
 
-            # Kick off speculative LLM pre-generation for the next expected response.
-            # This call uses the current transcript (without the next utterance) so the
-            # result may be used as a fast-path in _handle_generating if it finishes
-            # before the other party finishes speaking.
-            if self._llm:
+            if barged_in:
+                await self._broadcast({"type": "barge_in"})
+                log.info("barge_in_transition", call_id=self.ctx.call_id)
+            elif self._llm:
+                # Speculative pre-generation skipped on barge-in: context will change
                 self._speculative_task = asyncio.create_task(
                     self._run_speculative_generation()
                 )
@@ -840,15 +873,68 @@ class Orchestrator:
             self.ctx.error_source_state = AgentState.SPEAKING
             await self._transition(AgentState.ERROR)
 
-    async def _inject_audio_bytes(self, audio: bytes) -> None:
-        """Inject collected TTS audio bytes to the virtual mic device."""
+    async def _inject_audio_bytes(
+        self, audio: bytes, stop_event: Optional[asyncio.Event] = None
+    ) -> None:
+        """Inject collected TTS audio bytes to the virtual mic device.
+
+        Chunks audio into 100ms segments so stop_event is checked between writes,
+        allowing barge-in detection to abort playback with ≤100ms latency.
+        """
         from engine.modules.audio.virtual_devices import inject_audio
 
-        async def _single_chunk():
-            yield audio
+        # 16 kHz / 16-bit PCM → 3200 bytes per 100ms
+        CHUNK_SIZE = 16000 * 2 * 100 // 1000
+
+        async def _chunked():
+            offset = 0
+            while offset < len(audio):
+                if stop_event and stop_event.is_set():
+                    return
+                yield audio[offset : offset + CHUNK_SIZE]
+                offset += CHUNK_SIZE
 
         if self._virtual_mic_device:
-            await inject_audio(_single_chunk(), device=self._virtual_mic_device)
+            await inject_audio(_chunked(), device=self._virtual_mic_device)
+        else:
+            # Dry-run: drain generator and yield between chunks so concurrent
+            # tasks (e.g. barge-in monitor) get CPU time between each 100ms segment.
+            async for _ in _chunked():
+                await asyncio.sleep(0)
+
+    async def _monitor_barge_in(self, stop_event: asyncio.Event) -> None:
+        """Background task: drain audio_chunk events through VAD; sets stop_event on speech onset."""
+        if not self._vad:
+            return
+        threshold = self._vad_config.barge_in_threshold if self._vad_config else 0.3
+        try:
+            while not stop_event.is_set():
+                try:
+                    audio_data = await asyncio.wait_for(
+                        self._wait_for_event("audio_chunk"), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if not audio_data:
+                    continue
+                chunk = (
+                    audio_data
+                    if isinstance(audio_data, (bytes, bytearray))
+                    else bytes(audio_data)
+                )
+                for result in self._vad.process_chunk(chunk):
+                    if result.is_speech and result.probability >= threshold:
+                        log.info(
+                            "barge_in_detected",
+                            call_id=self.ctx.call_id,
+                            probability=result.probability,
+                        )
+                        stop_event.set()
+                        return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("barge_in_monitor_error", error=str(exc))
 
     async def _inject_lipsync(self, audio: bytes) -> None:
         """Generate lip-sync video from audio and push frames to virtual camera."""

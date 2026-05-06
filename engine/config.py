@@ -92,6 +92,8 @@ class VADConfig(BaseModel):
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     min_silence_duration_ms: int = Field(default=1500, ge=100)
     speech_pad_ms: int = Field(default=300, ge=0)
+    barge_in_enabled: bool = True
+    barge_in_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
-import React, { useEffect, useReducer, useRef } from "react";
+import React, { useEffect, useReducer } from "react";
 import { useWebSocket } from "./hooks/useWebSocket.js";
 import ReviewPanel from "./components/ReviewPanel.jsx";
 import StatusBar from "./components/StatusBar.jsx";
+import TranscriptPanel from "./components/TranscriptPanel.jsx";
 
 const TOKEN = new URLSearchParams(window.location.search).get("token") || "change-me-in-production";
 
@@ -12,6 +13,9 @@ const initialState = {
   callStartTime: null,
   lastSpoken: null,
   errorMessage: null,
+  transcript: [],
+  partialText: "",
+  nextId: 0,
 };
 
 function reducer(state, action) {
@@ -36,6 +40,52 @@ function reducer(state, action) {
       };
     case "response_selected":
       return { ...state, lastSpoken: action.text };
+    case "partial_transcript":
+      return { ...state, partialText: action.text };
+    case "utterance_complete":
+      return {
+        ...state,
+        partialText: "",
+        transcript: [
+          ...state.transcript,
+          {
+            id: state.nextId,
+            speaker: "other",
+            text: action.text,
+            turn: action.turn,
+            interrupted: false,
+          },
+        ],
+        nextId: state.nextId + 1,
+      };
+    case "speaking":
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript,
+          {
+            id: state.nextId,
+            speaker: "agent",
+            text: action.text,
+            turn: state.transcript.length > 0
+              ? state.transcript[state.transcript.length - 1].turn
+              : 0,
+            interrupted: false,
+          },
+        ],
+        nextId: state.nextId + 1,
+      };
+    case "barge_in": {
+      const last = state.transcript[state.transcript.length - 1];
+      if (!last || last.speaker !== "agent") return state;
+      return {
+        ...state,
+        transcript: [
+          ...state.transcript.slice(0, -1),
+          { ...last, interrupted: true },
+        ],
+      };
+    }
     case "call_ended":
       return { ...initialState };
     case "error":
@@ -65,32 +115,33 @@ export default function App() {
   const wsStatus = readyState === WebSocket.OPEN ? "connected" : "disconnected";
 
   return (
-    <div style={styles.root}>
+    <div className="app-layout">
       <StatusBar agentState={state.agentState} callStartTime={state.callStartTime} />
 
-      <div style={styles.body}>
-        {state.agentState === "reviewing" && state.options.length > 0 ? (
-          <ReviewPanel
-            options={state.options}
-            timeoutSeconds={state.timeoutSeconds}
-            onSelect={handleSelect}
-            onTakeover={handleTakeover}
-          />
-        ) : (
-          <div style={styles.idle}>
-            <div style={styles.stateLabel}>{state.agentState.replace("_", " ").toUpperCase()}</div>
-            {state.lastSpoken && (
-              <div style={styles.spoken}>
-                <span style={styles.spokenLabel}>Last spoken</span>
-                <p style={styles.spokenText}>{state.lastSpoken}</p>
-              </div>
-            )}
-            {state.errorMessage && (
-              <div style={styles.errorBox}>{state.errorMessage}</div>
-            )}
-          </div>
-        )}
-      </div>
+      <TranscriptPanel transcript={state.transcript} partialText={state.partialText} />
+
+      {state.agentState === "reviewing" && state.options.length > 0 && (
+        <ReviewPanel
+          options={state.options}
+          timeoutSeconds={state.timeoutSeconds}
+          onSelect={handleSelect}
+          onTakeover={handleTakeover}
+        />
+      )}
+
+      {state.agentState !== "reviewing" && (state.lastSpoken || state.errorMessage) && (
+        <div style={styles.statusArea}>
+          {state.lastSpoken && (
+            <div style={styles.spoken}>
+              <span style={styles.spokenLabel}>Last spoken</span>
+              <p style={styles.spokenText}>{state.lastSpoken}</p>
+            </div>
+          )}
+          {state.errorMessage && (
+            <div style={styles.errorBox}>{state.errorMessage}</div>
+          )}
+        </div>
+      )}
 
       <div style={styles.footer}>
         <span style={{ ...styles.wsDot, background: wsStatus === "connected" ? "var(--green)" : "var(--red)" }} />
@@ -101,35 +152,18 @@ export default function App() {
 }
 
 const styles = {
-  root: {
+  statusArea: {
+    padding: "0 20px 16px",
     display: "flex",
     flexDirection: "column",
-    minHeight: "100vh",
-  },
-  body: {
-    flex: 1,
-    overflow: "auto",
-  },
-  idle: {
-    display: "flex",
-    flexDirection: "column",
+    gap: 10,
     alignItems: "center",
-    justifyContent: "center",
-    minHeight: 320,
-    gap: 20,
-    padding: 32,
-  },
-  stateLabel: {
-    fontSize: 24,
-    fontWeight: 700,
-    color: "var(--text-muted)",
-    letterSpacing: 2,
   },
   spoken: {
     background: "var(--surface)",
     border: "1px solid var(--border)",
     borderRadius: "var(--radius)",
-    padding: "16px 20px",
+    padding: "12px 16px",
     maxWidth: 560,
     width: "100%",
   },
@@ -139,21 +173,21 @@ const styles = {
     textTransform: "uppercase",
     letterSpacing: 1,
     display: "block",
-    marginBottom: 6,
+    marginBottom: 4,
   },
   spokenText: {
-    fontSize: 15,
-    lineHeight: 1.6,
+    fontSize: 14,
+    lineHeight: 1.5,
   },
   errorBox: {
     background: "#2d1a1a",
     border: "1px solid var(--red)",
     borderRadius: "var(--radius)",
-    padding: "12px 18px",
+    padding: "10px 16px",
     color: "var(--red)",
     maxWidth: 560,
     width: "100%",
-    fontSize: 14,
+    fontSize: 13,
   },
   footer: {
     display: "flex",
@@ -161,11 +195,13 @@ const styles = {
     gap: 8,
     padding: "8px 20px",
     borderTop: "1px solid var(--border)",
+    flexShrink: 0,
   },
   wsDot: {
     width: 8,
     height: 8,
     borderRadius: "50%",
+    flexShrink: 0,
   },
   wsLabel: {
     fontSize: 12,
